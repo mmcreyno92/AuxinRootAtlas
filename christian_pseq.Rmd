@@ -1,0 +1,232 @@
+---
+title: "DE analysis on A. thaliana BIN2/RAPTOR1B mutant plants using PoissonSeq"
+author: "Christian Montes"
+date: "May 12, 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+We first load the required libraries
+```{r message=FALSE}
+shhh <- suppressWarnings # It's a library, so shhh!
+shhh(library(PoissonSeq))
+shhh(library(ggbiplot))
+shhh(library(edgeR))
+shhh(library(openxlsx))
+shhh(library(EnhancedVolcano))
+shhh(library(tidyverse))
+shhh(library(knitr))
+```
+
+## Here is where you provide basic information for the analysis: counts file, number of replicates, and set qvalue/FC cutoff
+```{r, message=FALSE}
+metadata <- read_csv("metadata.csv")
+read_csv("read_counts_BR.csv") %>%
+#  select(gname, 1:17) %>%
+  `colnames<-`(c("gname", paste(metadata$name,metadata$`Bio Rep`, sep = ""))) %>%
+  column_to_rownames(var = "gname") -> counts
+qval <- 0.05
+FC <- 2
+DE_list <- "DE_pairs.csv" #leave blank if you don't have a list of specific pairwise comparisons to test, otherwise provide filename
+nreps <- 4
+multicomp <- "no"
+
+```
+
+# Let's see how samples cluster (in a PCA plot)
+
+```{r, echo=FALSE}
+#perform PCA
+pcaresults = prcomp(t(floor(log2(counts+1))))
+
+#plot PCA
+g <- ggbiplot(pcaresults, groups = factor(unlist(metadata$name)),
+              labels=colnames(counts),
+              var.axes=FALSE,labels.size=3,ellipse=TRUE) +
+  theme(text = element_text(size=14), aspect.ratio = 1) +
+  ggtitle(label = "All samples included") +
+  xlim(-2.5, 2.5)
+print(g)
+```
+
+Let's see how clustering looks without sample 'bin2T_M2'
+
+```{r, echo=FALSE}
+#get rid of bad rep
+pcaresultsnoBadRep = prcomp(t(floor(log2(counts+1)[,c(1,3:32)])))
+#plot PCA
+g <- ggbiplot(pcaresultsnoBadRep, groups = factor(unlist(metadata[c(1,3:32),2])),
+              labels=colnames(counts[c(1,3:32)]),
+              var.axes=F,labels.size=3,ellipse=TRUE) +
+    theme(text = element_text(size=14), aspect.ratio=1) + 
+    ggtitle(label = "Sample bin2T_M2 removed")
+print(g)
+```
+
+Clustering improves when we remove sample bin2T_M2.
+
+#Performing PoissonSeq DE analysis
+
+## If we need, We can first do multiclass comparisons to get the genes DE in at least one comparison. If now, we skip this step.
+```{r}
+counts <- counts[,c(1,3:32)]
+if (multicomp == "yes") {
+  yall=c(rep(1, times = 3),c(rep(2:8, each = 4)))
+  pseq<- PS.Main(dat=list(n=counts,y=yall,type="multiclass",pair=FALSE,gname=row.names(counts)))
+  write.csv(pseq,'PSeq_first_multiclass_comp.csv')
+  mygenes <- pseq[pseq$fdr<0.05,]
+  write.csv(mygenes,'PSeq_first_multiclass_comp_q0.05.csv')
+} else { }
+
+```
+
+## We now perform pairwise comparisons using only the significant genes from previous multiclass comparison (This helps increase the power).
+
+We want to get the TMM-normalized count values to use as fold change value later
+```{r}
+counts = counts[order(row.names(counts)),]
+norm.factors = calcNormFactors(counts,method="TMM")
+tmm = equalizeLibSizes(counts,norm.factors=norm.factors)$pseudo.counts
+write.csv(tmm,"TMM_all.csv")
+```
+
+We extract only the genes significant from our multiclass comparison
+```{r}
+if (multicomp == "yes") {
+  mygenes = mygenes[order(mygenes$gname),]
+  mycounts = counts[row.names(counts)%in%mygenes$gname,]
+} else {
+  mycounts = counts
+}
+```
+
+And, either make a list of all pairwise comparisons, or provide a file with specific comparison to test
+```{r, message=FALSE}
+if (DE_list == "") {
+  mysamples = unique(metadata$name)
+  mysamples = mysamples[!grepl("Ref",mysamples,ignore.case=TRUE)]
+  comps = rep("",choose(length(mysamples),2))
+  currentrow = 1
+  for (i in 1:(length(mysamples)-1)){
+    for (j in (i+1):length(mysamples)){
+      comps[currentrow] = paste(mysamples[i],"_vs_",mysamples[j],sep="")
+      currentrow = currentrow+1
+    }
+  }
+} else {
+  comps <- read_csv(DE_list, skip = 1)
+  comps$pairs <- paste(comps$control, "_vs_", comps$treatment, sep = "")
+  comps <- comps$pairs
+}
+```
+
+## Now we can perform PoissonSeq analysis
+```{r}
+pseqdata = mycounts
+newwb <- createWorkbook()
+newwb2 <- createWorkbook()
+for (i in 1:length(comps)){
+  #get the intensities for this comparison
+  sepcomps = strsplit(comps[i],"_vs_")
+  intensities1 = pseqdata[,grepl(sepcomps[[1]][1],colnames(pseqdata))]
+  intensities2 = pseqdata[,grepl(sepcomps[[1]][2],colnames(pseqdata))]
+
+  #make indicator variable y
+  y= c(rep(1,dim(intensities1)[2]),rep(2,dim(intensities2)[2]))
+  #perform PSeq
+  pdata = data.frame(intensities1,intensities2)
+  pseq<- PS.Main(dat=list(n=pdata,y=y,type="twoclass",pair=FALSE,gname=row.names(pdata)))
+  #get the actual fc from TMM-normalized counts
+  TMMint1 <- tmm[,grepl(sepcomps[[1]][1],colnames(tmm))]
+  TMMint2 <- tmm[,grepl(sepcomps[[1]][2],colnames(tmm))]
+
+  TMMint1 = TMMint1[order(row.names(TMMint1)),]
+  TMMint2 = TMMint2[order(row.names(TMMint2)),]
+  myFC = data.frame(rowMeans(TMMint2[,])/rowMeans(TMMint1[,]),row.names=row.names(TMMint1))
+  myFC <- rownames_to_column(myFC, var = "gname")
+  pseq %<>% inner_join(myFC, by="gname") %>%
+    mutate(log2FC = log2(rowMeans.TMMint2......rowMeans.TMMint1.....)) %>%
+    arrange(gname)
+  
+  myresults = data.frame(pseq[,c(1:5,8)],TMMint1[row.names(TMMint1)%in%pseq$gname,],
+                         TMMint2[row.names(TMMint2)%in%pseq$gname,])
+  #save
+  addWorksheet(wb = newwb2, sheetName = comps[i], gridLines = TRUE)
+  writeDataTable(wb=newwb2, sheet=comps[i],x=myresults,tableStyle="none",
+                 rowNames=FALSE,withFilter=FALSE,
+                 bandedRows=FALSE,bandedCols=FALSE)
+  
+  #make volcano plot
+  v <- EnhancedVolcano(pseq,rownames(pseq),'log2FC','fdr',
+                       pointSize=1,labSize=0,FCcutoff=1,pCutoff=qval,
+                       title=paste(comps[i],"(",sum(pseq$fdr<qval),")",sep=""),
+                       xlim = c(-3,3), ylim = c(0,5), col=c('grey30','grey60','royalblue','red2'),
+                       legendLabels=c('NS','FC>2, q>0.05 (NS)','FC<2, q<0.05 (S)','FC>2, q<0.05 (S)'),
+                       legendLabSize=10, ylab = bquote(~-Log[10]~italic(q)))
+  
+  assign(paste("volc",sepcomps[[1]][2],"vs", sepcomps[[1]][1], sep = "_"), v)
+  
+  
+  #make qvalue histogram
+  h <- ggplot(pseq, aes(pval)) + 
+    geom_histogram(bins = 200, fill = "white", color = "black") + 
+    geom_hline(yintercept = mean(hist(pseq$pval, breaks = 100, plot = FALSE)$counts[26:100])) +
+    ggtitle(paste(sepcomps[[1]][2],"vs", sepcomps[[1]][1],"p-value distribution", sep = " "))
+  assign(paste("pval",sepcomps[[1]][2],"vs", sepcomps[[1]][1], sep = "_"), h)
+ 
+  #get differentially expressed genes and save
+  mypros = subset(myresults, myresults$fdr<qval)
+  mypros <- subset(mypros, log2FC >= log2(FC) | log2FC <= -log2(FC))
+  #save
+  addWorksheet(wb = newwb, sheetName = comps[i], gridLines = TRUE)
+  writeDataTable(wb=newwb, sheet=comps[i],x=mypros,tableStyle="none",
+                 rowNames=FALSE,withFilter=FALSE,
+                 bandedRows=FALSE,bandedCols=FALSE)
+  if (i == 1) {
+    data.frame("pair","Sig", "up", "down") %>%
+    `colnames<-`(c("pair","Sig", "up", "down")) %>%
+    mutate(pair = comps[i], Sig = nrow(mypros)-1, up = sum(mypros$log2FC>0),
+           down = sum(mypros$log2FC<0)) -> de_data
+  } else {
+    data.frame("pair","Sig", "up", "down") %>%
+    `colnames<-`(c("pair","Sig", "up", "down")) %>%
+    mutate(pair = comps[i], Sig = nrow(mypros)-1, up = sum(mypros$log2FC>0),
+           down = sum(mypros$log2FC<0)) %>%
+      bind_rows(de_data) -> de_data
+  }
+  
+}
+colnames(de_data) <- c("DE pair","Sig. DE genes (0.05 FDR, FC2)", "Upreg", "Downreg")
+plotnames <- ls(knitr::knit_global(),pattern = "^pval.*$")
+volcnames <- ls(knitr::knit_global(),pattern = "^volc.*$")
+```
+
+## PoissonSeq DE analysis summary table
+
+```{r, echo = FALSE, results = 'asis'}
+kable(de_data)
+```
+
+## Visualizing the results
+
+What does the test p-value distribution look like?
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+mget(plotnames)
+```
+
+Let's do some Volcano plots!
+
+```{r, echo=FALSE, message=FALSE}
+# make a volcano plot
+mget(volcnames)
+```
+
+# Finally, we export the results into an Excel file
+```{r}
+saveWorkbook(newwb, paste("Pseq_all_comps_q",qval,"_FC", FC,".xlsx",sep=""),overwrite=TRUE)
+saveWorkbook(newwb2, "Pseq_all_comps.xlsx",overwrite=TRUE)
+message("Finished!")
+```

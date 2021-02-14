@@ -1,0 +1,549 @@
+---
+title: "Internal reference scaling (IRS) normalization and phospho DE assay of TMT-labelled BIN2/RAPTOR mutants"
+author: "Christian Montes"
+date: "March, 16th, 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+palette(c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7", "#999999"))
+```
+## Tutorial adapted from :  
+https://pwilmart.github.io/TMT_analysis_examples/multiple_TMT_MQ.html
+
+We first load the required libraries
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse) 
+library(limma) 
+library(edgeR) 
+library(psych)
+library(ggExtra)
+library(scales)
+library(gsubfn)
+library(knitr)
+library(openxlsx)
+library(ggbiplot)
+library(EnhancedVolcano)
+```
+
+Now, we want to read our prepared data file containing the raw (non corrected) intensities
+(preparation of data was adapted from [this link](https://github.com/pwilmart/TMT_analysis_examples/blob/master/Multiple_TMT_MQ/MQ_data_prep_steps.txt) and performed using [Perseus](https://maxquant.net/perseus/) 1.6.10.50)
+```{r, message=FALSE, warning=FALSE}
+# First we define our input/output file name (if other than proteinGroups.txt)
+experimentDescriptor <- "BR_RAPTOR"
+infile <- "Phospho (STY)Sites_filtered.txt" # Write here the name of the file containing the data you want to analyze
+
+#Here we write "yes" if doing the optional extra data analysis using phosphosites/proteins detected in 2 out of 3 LC-MS/MS runs
+optional <- "yes"
+
+read.delim(file = infile, sep = "\t", header = T, check.names = F, stringsAsFactors = F, comment.char = "#") %>%
+  rownames_to_column(var = "UID") %>%
+  select(matches(experimentDescriptor), matches("Amino acid"):id,UID, matches("Number of Phospho"),
+         -matches("Unique")) -> data_raw
+
+sampledata <- read.delim(file = "sampledata.txt", sep = "\t", header = T, skip = 1, check.names = F, stringsAsFactors = F)
+outname <- paste(experimentDescriptor,"_TMT_normalization", sep = "")
+```
+
+We want to reformat the table, selecting only the rows (phospho-sites) that were detected, at least, in 2 out of 3 LC-MS/MS runs. We also save the annotation columns.
+```{r}
+# We take care of zeros (missing data) keeping only phospho-sites detected in all 3 runs or, at least 2 of 3 runs
+data_raw[data_raw[] == 0] <- NA
+data_raw <- data_raw[rowSums(is.na(data_raw[1:nrow(sampledata)]))<=10,]
+
+# Save the annotation columns
+annotate_df <- select(data_raw, matches("Amino acid"):matches("Number of Phospho"))
+
+# Finally extract the columns containing non-corrected intensity values to perform our data analysis
+data_raw <- select(data_raw, matches(experimentDescriptor))
+colnames(data_raw)<- sampledata[,2]
+```
+
+## Exploring the raw data
+This is our starting dataset
+```{r}
+dim(data_raw)
+head(as.data.frame(data_raw))
+```
+
+Let's first see what our starting MQ data look like in a boxplot and in a density plot (it is like a distribution histogram).
+```{r, echo = F}
+boxplot(log2(data_raw), col = as.factor(sampledata[,4]), 
+        notch = TRUE, main = "Log2 raw intensity")
+
+plotDensities(log2(data_raw), col = c(1:c(nlevels(as.factor(sampledata[,4])))), main = "Log2 raw intensity")
+```
+  
+Let's take a look at the total intensity for each channel
+```{r}
+format(round(colSums(data_raw, na.rm = T), digits = 0), big.mark = ",")
+```
+
+There was supposed to be the same amount of protein labeled in each sample. We should have the total signals in each channel summing to the same value. We can average the numbers below and compute normalization factors to make the sums end up the same.  
+
+## Performing sample loading normalization (SL)
+Sample loading (SL) normalization adjusts each TMT experiment to equal signal per channel. For this we will use the mean total intensity across all channels in all three reps to set a scaling factor.
+```{r}
+# separate the TMT data by experiment, we will use this for IRS
+run1_raw <- data_raw[c(1:10)]
+run2_raw <- data_raw[c(11:20)]
+run3_raw <- data_raw[c(21:30)]
+
+# figure out the global scaling value
+target <- mean(c(colSums(run1_raw, na.rm = T), colSums(run2_raw, na.rm = T),
+                 colSums(run3_raw, na.rm = T)))
+
+# Let's do the sample loading normalization, there is a different correction factor for each column
+norm_facs <- target / colSums(run1_raw, na.rm = T)
+run1_sl <- sweep(run1_raw, 2, norm_facs, FUN = "*")
+norm_facs <- target / colSums(run2_raw, na.rm = T)
+run2_sl <- sweep(run2_raw, 2, norm_facs, FUN = "*")
+norm_facs <- target / colSums(run3_raw, na.rm = T)
+run3_sl <- sweep(run3_raw, 2, norm_facs, FUN = "*")
+
+# and finally we make a SL-normalized data frame
+data_sl <- cbind(run1_sl, run2_sl, run3_sl)
+```
+
+Now, let's explore our SL norm dataset using box plot and a density plot
+```{r, echo=F}
+boxplot(log2(data_sl), col = as.factor(sampledata[,4]), 
+        notch = TRUE, main = "Sample Loading (SL) normalized data")
+
+plotDensities(log2(data_sl), col = c(1:c(nlevels(as.factor(sampledata[,4])))), main = "SL normalization")
+```
+
+Let's take a look at the total intensity for each channel after SL
+```{r}
+format(round(colSums(data_sl, na.rm = T), digits = 0), big.mark = ",")
+```
+
+Everything looks good here, thought we can add trimmed mean of M-values (TMM) normalization from edgeR, to correct for compositional bias
+
+## Testing trimmed mean of M-values (TMM) normalization from edgeR
+Since we process similar total amounts of material (protein or mRNA), changes in expression of a small number of highly abundant proteins can make all of the rest of the protein appear to be down regulated.The trimmed mean of M values (TMM) method, developed for RNA-Seq data, can remove compositional bias.
+We will examinate what TMM norm does to our raw data and to our SL norm data.
+```{R}
+# First calculate the normalization factor
+raw_tmm <- calcNormFactors(na.omit(data_raw))
+# Let's do TMM norm over raw data
+data_raw_tmm <- sweep(data_raw, 2, raw_tmm, FUN = "/")
+
+# now let's see exactly what TMM does with SL data
+sl_tmm <- calcNormFactors(na.omit(data_sl))
+data_sl_tmm <- sweep(data_sl, 2, sl_tmm, FUN = "/")
+```
+
+Now let's see what TMM does to our SL norm dataset and compare raw vs SL vs SL-TMM
+```{r, echo=F}
+boxplot(log2(data_raw), col = as.factor(sampledata[,4]), 
+        notch = TRUE, main = "RAW intensity")
+
+boxplot(log2(data_sl), col = as.factor(sampledata[,4]), 
+        notch = TRUE, main = "Sample Loading (SL) normalized data")
+
+boxplot(log2(data_sl_tmm), notch = TRUE, col = as.factor(sampledata[,4]), 
+        main = "TMM normalization of SL data")
+
+plotDensities(log2(data_raw), col = c(1:c(nlevels(as.factor(sampledata[,4])))), main = "Raw intensity")
+plotDensities(log2(data_sl), col = c(1:c(nlevels(as.factor(sampledata[,4])))), main = "SL normalization")
+plotDensities(log2(data_sl_tmm), col = c(1:c(nlevels(as.factor(sampledata[,4])))), main = "SL/TMM normalization")
+```
+
+It seems that TMM normalization *may improve* our dataset
+
+Let's see how our samples cluster in a MDS plot (a PCA plot can be used too)
+```{r, echo=F}
+
+pcaresults = prcomp(t(floor(log2(na.omit(data_raw+1)))))
+ggbiplot(pcaresults, groups = as.factor(sampledata$Exp.name),
+         labels=colnames(data_raw),
+         var.axes=FALSE,labels.size=3,ellipse=TRUE) +
+  theme(text = element_text(size=14)) +
+  labs(title = "RAW sample clustering")
+
+pcaresults = prcomp(t(floor(log2(na.omit(data_sl+1)))))
+ggbiplot(pcaresults, groups = as.factor(sampledata$Exp.name),
+              labels=colnames(data_sl),
+              var.axes=FALSE,labels.size=3,ellipse=TRUE) +
+  theme(text = element_text(size=14)) +
+  labs(title = "SL sample clustering")
+
+pcaresults = prcomp(t(floor(log2(na.omit(data_raw_tmm+1)))))
+ggbiplot(pcaresults, groups = as.factor(sampledata$Exp.name),
+              labels=colnames(data_raw_tmm),
+              var.axes=FALSE,labels.size=3,ellipse=TRUE) +
+  theme(text = element_text(size=14)) +
+  labs(title = "TMM sample clustering")
+
+pcaresults = prcomp(t(floor(log2(na.omit(data_sl_tmm+1)))))
+ggbiplot(pcaresults, groups = as.factor(sampledata$Exp.name),
+              labels=colnames(data_sl_tmm),
+              var.axes=FALSE,labels.size=3,ellipse=TRUE) +
+  theme(text = element_text(size=14)) +
+  labs(title = "SL/TMM sample clustering")
+```
+
+As we can see, we have a very strong clustering by LC-MS/MS run.
+
+To perform IRS normalization, we first need to identify the channel(s) used as the pooled reference (in our case we used the last two channels, 130C and 131 on each run).
+```{r}
+# We make a working data frame with the row sum (peptide/protein/site intensity) of the reference channels for each run
+irs <- tibble(rowSums(run1_sl[9:10]), rowSums(run2_sl[9:10]), rowSums((run3_sl[9:10])))
+colnames(irs) <- c("sum1", "sum2", "sum3")
+
+# We get the geometric mean intensity for each row (peptide/protein/site)
+irs$average <- apply(irs, 1, function(x) exp(mean(log(x), na.rm = T)))
+
+# Compute a scaling factor for each replicate
+irs$fac1 <- irs$average / irs$sum1
+irs$fac2 <- irs$average / irs$sum2
+irs$fac3 <- irs$average / irs$sum3
+
+# Make a new data frame with normalized data (not including the pooled references)
+data_irs <- run1_sl[1:8] * irs$fac1
+data_irs <- cbind(data_irs, run2_sl[1:8] * irs$fac2, run3_sl[1:8]*irs$fac3)
+# Since we removed the TMT channels containing the pooled refrences, we have to remove them from our sampledata object
+sampledata <- filter(sampledata, !grepl("ref", sampledata$sample))
+```
+
+Let's analyze the effect of IRS on our dataset
+```{r, echo=F}
+boxplot(log2(data_irs), col = as.factor(sampledata[,4]), 
+        notch = TRUE, main =  "Internal Reference Scaling (IRS) normalized data")
+
+plotDensities(log2(data_irs), col = c(1:c(nlevels(as.factor(sampledata[,4])))), main = "IRS data")
+```
+
+Let's take a look at our total intensities on each channel
+```{r}
+format(round(colSums(data_irs, na.rm = T), digits = 0), big.mark = ",")
+```
+
+We can add **TMM normalization**
+```{r}
+irs_tmm <- calcNormFactors(na.omit(data_irs))
+data_irs_tmm <- sweep(data_irs, 2, irs_tmm, FUN = "/")
+```
+
+```{r, echo=F}
+boxplot(log2(data_irs_tmm), col = as.factor(sampledata[,4]), 
+        notch = TRUE, main = "TMM normalization of SL-IRS data")
+```
+
+And, finally, let's examine the way our samples cluster now
+```{r, echo=F}
+pcaresults = prcomp(t(floor(log2(na.omit(data_irs_tmm+1)))))
+ggbiplot(pcaresults, groups = as.factor(sampledata$sample),
+              labels=colnames(data_irs_tmm),
+              var.axes=FALSE,labels.size=3,ellipse=TRUE) +
+  theme(text = element_text(size=14)) +
+  labs(title = "TMM/SL IRS sample clustering")
+```
+
+## Exporting the dataset
+Let's add the accession numbers to our data and export the table
+```{r}
+colnames(data_irs_tmm) <- paste(sampledata[,2],"_", sampledata[,3], " Normalized Intensity", sep = "")
+data_irs_tmm_log <- log2(data_irs_tmm)
+colnames(data_irs_tmm_log) <- paste(sampledata[,2],"_", sampledata[,3], " Normalized Intensity Log2", sep = "")
+annotate_df[is.na(annotate_df)] <- 0
+data_irs_tmm <- cbind(data_irs_tmm, data_irs_tmm_log,annotate_df)
+write.table(data_irs_tmm, paste(outname,".tsv", sep = ""), sep = "\t", row.names = F)
+```
+
+# Phospho-sites differential expression analysis
+
+```{r, message=F, warning=FALSE}
+# Select the output folder
+outdir <- "output_BR_TOR_phosDE_edgeR"
+dir.create(outdir)
+# We need to provide a list with the sample pairs we want to compare for DE analysis
+DE_pairList <- read.delim("DE_pairs.csv", skip = 1, header = T, sep = ",", row.names = NULL, stringsAsFactors = F)
+
+# set up the sample mapping 
+group <- factor(sampledata$sample) # here you provide the number of replicates
+str(group)
+
+# Also, we get rid of sites/proteins with missing values and update the annotation object
+data_irs_tmm <- data_irs_tmm[rowSums(is.na(data_irs_tmm[1:nrow(sampledata)]))<1,]
+annotate_df <- select(data_irs_tmm, matches("Amino acid"):matches("Number of Phospho"))
+data_norm <- select(data_irs_tmm, matches("Normalized Intensity"))
+data_irs_tmm <- data_irs_tmm[,1:c(nrow(sampledata))]
+```
+
+We create and format the DGEList object and estimate biological coefficent of variation (BCV) and dispersions using quantile-adjusted conditional maximum likelihood (qCML, negative binomial distribution based dispersions).
+```{r, message=F,warning=FALSE}
+# create a DGEList object with our data and extract the normalized count
+y_MQ <- DGEList(counts = data_irs_tmm, group = group)
+y_MQ <- calcNormFactors(y_MQ)
+y_MQ <- estimateDisp(y_MQ)
+y_cpm <- cpm(y_MQ,normalized.lib.sizes = F)
+```
+
+On the created DGEList `y_MQ` we have that `y_MQ$counts` is the data, and `y_MQ$samples` has sample information. It is always advisable to double-check that each sample is correctly assigned to the corresponding treatment group.
+```{r}
+y_MQ$samples
+```
+
+```{r, echo=F}
+plotBCV(y_MQ, main = "Biological variation (BCV)")
+```
+
+We then peform the negative binomial **extact test** to address protein differential expression. This test can be used to compare two conditions at a time.
+We also add a FDR "confidence" filter:  
+- 0.01 and lower = high confidence  
+- 0.05 to 0.01 = medium confidence  
+- 0.1 to 0.05 = low confidence  
+- 0.1 and higher = no significant  
+```{r, message=FALSE, warning=FALSE}
+# the exact test object has columns like fold-change, CPM, and p-values
+de_data <- data.frame()
+sum_table <- read.delim(file = paste(outname,".txt", sep = ""), sep = "\t")
+for (i in 1:nrow(DE_pairList)) {
+    # This performs the extact test for DE
+  ex.test <- exactTest(y_MQ, pair = c(DE_pairList[i,1], DE_pairList[i,2]))
+
+  # This performs a BH FDR correction
+  ex.test_tt <- topTags(ex.test, n = 30000, sort.by = "none")
+  ex.test_tt <- ex.test_tt$table
+  ex.test_tt <- ex.test_tt[-2]
+  # This creates a "confidence filter" based on FDR
+  ex.test_tt$candidate <- "no"
+  ex.test_tt[which(ex.test_tt$FDR <= 0.10 & ex.test_tt$FDR > 0.05), dim(ex.test_tt)[2]] <- "low"
+  ex.test_tt[which(ex.test_tt$FDR <= 0.05 & ex.test_tt$FDR > 0.01), dim(ex.test_tt)[2]] <- "med"
+  ex.test_tt[which(ex.test_tt$FDR <= 0.01), dim(ex.test_tt)[2]] <- "high"
+  ex.test_tt$candidate <- factor(ex.test_tt$candidate, levels = c("high", "med",  "low", "no"))
+  dat <- data.frame(paste(DE_pairList[i,2],"_vs_",DE_pairList[i,1], sep = ""),
+                    nrow(subset(ex.test_tt, ex.test_tt[,4] != "no")),
+                    nrow(subset(ex.test_tt, ex.test_tt[,4] != "no" & ex.test_tt[,1] < 0)),
+                    nrow(subset(ex.test_tt, ex.test_tt[,4] != "no" & ex.test_tt[,1] > 0)))
+  de_data <- rbind(de_data, dat)
+  
+  # Then, we add a filter for up or down regulated elements
+  ex.test_tt$up_or_down <- "no"
+  ex.test_tt[which(ex.test_tt[,1] < 0), dim(ex.test_tt)[2]] <- "down"
+  ex.test_tt[which(ex.test_tt[,1] > 0), dim(ex.test_tt)[2]] <- "up"
+  
+  # Now we add more info to our table before exporting
+  # First added the (mean) normalized intensity values
+  ex.test_tt <- cbind(data_norm,annotate_df,ex.test_tt)
+  
+  # Finally, we add Accession number, Unique ID, Description and KEGG ID for the protein / phospho-site
+  colnames(ex.test_tt) <- c(colnames(data_norm),
+                            colnames(annotate_df), "logFC", "pvalue", "FDR", "confidence level",
+                            paste(DE_pairList[i,2], DE_pairList[i,1], sep = "/"))
+  write.csv(ex.test_tt, file = paste(outdir,"/",DE_pairList[i,2],"_vs_",DE_pairList[i,1],
+                                     "_phospho_DE.csv", sep = ""), row.names = F)
+  # We also want to add some summary data to our summary table
+  sum_table[68+i] <- "NS"
+  sum_table[which(ex.test_tt$FDR <= 0.10), dim(sum_table)[2]] <- "+"
+  names(sum_table)[68+i] <- paste(DE_pairList[i,2], DE_pairList[i,1], sep = "/")
+  
+  # Now we create a p-value distribution histogram
+  p <- ggplot(ex.test_tt, aes(FDR)) + 
+    geom_histogram(bins = 200, fill = "white", color = "black") + 
+    geom_hline(yintercept = mean(hist(ex.test_tt$FDR, breaks = 100, plot = FALSE)$counts[26:100])) +
+    ggtitle(paste(DE_pairList[i,2],"vs", DE_pairList[i,1],"\nedgeR q-value distribution", sep = " "))
+  assign(paste("qval",DE_pairList[i,2],"vs", DE_pairList[i,1], sep = "_"), p)
+  # We also create a volcano plot
+  v <- EnhancedVolcano(ex.test_tt,rownames(ex.test_tt),'logFC','FDR',ylim=c(0,3),xlim=c(-3,3),pointSize=1,labSize=0,FCcutoff=1000000,pCutoff=0.1, legend = c("NS","Log2 FC","P","P & Log2 FC"),
+  legendLabels = c('NS', expression(Log[2]~FC), "q-value < 0.1", expression(p-value~and~log[2]~FC)),
+                       title=paste(DE_pairList[i,2],"vs", DE_pairList[i,1], "Volcano Plot",
+                                   "(",sum(ex.test_tt$FDR<0.1),")",sep = " ")) 
+  assign(paste("volc",DE_pairList[i,2],"vs" ,DE_pairList[i,1], sep = "_"), v)
+}
+colnames(de_data) <- c("DE pair","Sig. DE genes (10% FDR)", "Down", "Up")
+plotnames <- ls(knitr::knit_global(),pattern = "^qval.*$")
+volcnames <- ls(knitr::knit_global(),pattern = "^volc.*$")
+```
+
+Results summary table
+
+```{r, echo = F, results = 'asis'}
+kable(de_data)
+```
+
+What does the exact test p-value distribution look like?
+```{r echo=F, message=F, warning=FALSE}
+mget(plotnames)
+```
+
+## Visualizing the results
+
+Let's do some Volcano plots!
+
+```{r, echo=FALSE, message=F, warning=FALSE}
+# make a volcano plot
+mget(volcnames)
+```
+
+```{r, echo=F, message=F, warning=FALSE}
+#End the script if not doing the optional steps and create an Excel file with all the results
+set1 <- list.files(outdir,full.names = T)
+wb <- createWorkbook()
+addWorksheet(wb = wb, sheetName = "summary")
+if (optional == "no") {
+  writeData(wb = wb, sheet = 1, x = sum_table)
+  DE_pairList$sheetnames <- paste(DE_pairList[,2],"_vs_",DE_pairList[,1], sep = "")
+  DE_pairList <- DE_pairList[order(DE_pairList$sheetname),]
+  for (i in 1:length(set1)) {
+    DF <- read.csv(set1[i], check.names = F)
+    addWorksheet(wb = wb, sheetName = DE_pairList[i,3])
+    writeData(wb = wb, sheet = i+1, x = DF)
+    }
+  saveWorkbook(wb = wb, file = paste(outdir,".xlsx", sep = ""), overwrite = T)
+  knit_exit()
+}
+rm(list=ls(knitr::knit_global(),pattern = "^pval.*$"))
+rm(list=ls(knitr::knit_global(),pattern = "^volc.*$"))
+rm(volcnames)
+rm(plotnames)
+```
+
+## Optional: additional anlysis on sites/proteins detected in only 2 out of 3 LC-MS/MS runs:
+First, we load our normalized data one more time and filter out the sites/proteins detected in all3 LC-MS/MS runs.
+```{r, message=FALSE, warning=FALSE}
+#We first create the output folder fot this results
+outdir <- "output_BR_TOR_phosDE_edgeR_2of3"
+dir.create(outdir)
+
+#We need to reformat the dataset in order to remove non-detected elements, leaving only two replicates per treatment
+data_irs_tmm <- read.delim(file = paste(outname,".txt", sep = ""), sep = "\t", header = T, stringsAsFactors = F, check.names = F)
+headers <- c(colnames(data_irs_tmm[1:c(nrow(sampledata)/max(sampledata[,3])*max(sampledata[,3]-1))]),
+                                 colnames(data_irs_tmm[c(nrow(sampledata)+1):c(nrow(sampledata)+nrow(sampledata)/max(sampledata[,3])*max(sampledata[,3]-1))]), colnames(data_irs_tmm[c(nrow(sampledata)*2+1):c(ncol(data_irs_tmm))]))
+
+data_irs_tmm <- data_irs_tmm[rowSums(is.na(data_irs_tmm[1:c(max(sampledata[,3])*nlevels(as.factor(sampledata[,2])))]))>=7 & rowSums(is.na(data_irs_tmm[1:c(max(sampledata[,3])*nlevels(as.factor(sampledata[,2])))]))<9 ,]
+data_norm <- select(data_irs_tmm, matches("Normalized Intensity"))
+
+idx <- which(!is.na(data_irs_tmm),arr.ind = T)
+idx <- idx[order(idx[,1]),]
+data_irs_tmm <- data_irs_tmm[idx]
+data_irs_tmm <- as.data.frame(matrix(data_irs_tmm, ncol = 59, byrow = T), stringsAsFactors = FALSE)
+colnames(data_irs_tmm) <- headers
+annotate_df <- select(data_irs_tmm, matches("Amino acid"):matches("Number of Phospho"))
+data_irs_tmm <- data_irs_tmm[,1:c(nrow(sampledata)/max(sampledata[,3])*max(sampledata[,3]-1))]
+data_irs_tmm <- as.data.frame(lapply(X = data_irs_tmm, function(x) as.numeric(x)))
+
+# we modify our sampledata to reduce the number of replicates from 3 to 2
+sampledata <- sampledata[1:c(nrow(sampledata)/max(sampledata[,3])*max(sampledata[,3]-1)),]
+# set up the sample mapping 
+group <- factor(sampledata[,2]) # here you provide the list of samples
+str(group)
+```
+
+```{r, message=F,warning=FALSE}
+# create a DGEList object with our data and extract the normalized count
+y_MQ <- DGEList(counts = data_irs_tmm, group = group)
+y_MQ <- calcNormFactors(y_MQ)
+y_MQ <- estimateDisp(y_MQ)
+y_cpm <- cpm(y_MQ,normalized.lib.sizes = F)
+```
+
+```{r}
+y_MQ$samples
+```
+
+```{r, echo=F}
+plotBCV(y_MQ, main = "Biological variation (BCV)")
+```
+
+```{r, message=FALSE, warning=FALSE}
+# the exact test object has columns like fold-change, CPM, and p-values
+de_data <- data.frame()
+for (i in 1:nrow(DE_pairList)) {
+  # This performs the extact test for DE
+  ex.test <- exactTest(y_MQ, pair = c(DE_pairList[i,1], DE_pairList[i,2]))
+
+  # This performs a BH FDR correction
+  ex.test_tt <- topTags(ex.test, n = 30000, sort.by = "none")
+  ex.test_tt <- ex.test_tt$table
+  ex.test_tt <- ex.test_tt[-2]
+  # This creates a "confidence filter" based on FDR
+  ex.test_tt$candidate <- "no"
+  ex.test_tt[which(ex.test_tt$FDR <= 0.10 & ex.test_tt$FDR > 0.05), dim(ex.test_tt)[2]] <- "low"
+  ex.test_tt[which(ex.test_tt$FDR <= 0.05 & ex.test_tt$FDR > 0.01), dim(ex.test_tt)[2]] <- "med"
+  ex.test_tt[which(ex.test_tt$FDR <= 0.01), dim(ex.test_tt)[2]] <- "high"
+  ex.test_tt$candidate <- factor(ex.test_tt$candidate, levels = c("high", "med",  "low", "no"))
+  dat <- data.frame(paste(DE_pairList[i,2],"_vs_",DE_pairList[i,1], sep = ""),
+                    nrow(subset(ex.test_tt, ex.test_tt[,4] != "no")),
+                    nrow(subset(ex.test_tt, ex.test_tt[,4] != "no" & ex.test_tt[,1] < 0)),
+                    nrow(subset(ex.test_tt, ex.test_tt[,4] != "no" & ex.test_tt[,1] > 0)))
+  de_data <- rbind(de_data, dat)
+  
+  # Then, we add a filter for up or down regulated elements
+  ex.test_tt$up_or_down <- "no"
+  ex.test_tt[which(ex.test_tt[,1] < 0), dim(ex.test_tt)[2]] <- "down"
+  ex.test_tt[which(ex.test_tt[,1] > 0), dim(ex.test_tt)[2]] <- "up"
+  
+  # Now we add more info to our table before exporting
+  # First added the (mean) normalized intensity values
+  ex.test_tt <- cbind(data_norm,annotate_df,ex.test_tt)
+  
+  # Finally, we add Accession number, Unique ID, Description and KEGG ID for the protein / phospho-site
+  colnames(ex.test_tt) <- c(colnames(data_norm),
+                            colnames(annotate_df), "logFC", "pvalue", "FDR", "confidence level",
+                            paste(DE_pairList[i,2], DE_pairList[i,1], sep = "/"))
+  write.csv(ex.test_tt, file = paste(outdir,"/",DE_pairList[i,2],"_vs_",DE_pairList[i,1],
+                                     "_phospho_DE.csv", sep = ""), row.names = F)
+  
+  # We also want to add some summary data to our summary table
+  sum_table[which(ex.test_tt$FDR <= 0.10), dim(sum_table)[2]] <- "+"
+  # Now we create a p-value distribution histogram
+  p <- ggplot(ex.test_tt, aes(FDR)) + 
+    geom_histogram(bins = 200, fill = "white", color = "black") + 
+    geom_hline(yintercept = mean(hist(ex.test_tt$FDR, breaks = 100, plot = FALSE)$counts[26:100])) +
+    ggtitle(paste(DE_pairList[i,2],"vs", DE_pairList[i,1],"\nedgeR q-value distribution", sep = " "))
+  assign(paste("qval",DE_pairList[i,2],"vs", DE_pairList[i,1], sep = "_"), p)
+  # We also create a volcano plot
+  v <- EnhancedVolcano(ex.test_tt,rownames(ex.test_tt),'logFC','FDR',ylim=c(0,3),xlim=c(-3,3),pointSize=1,labSize=0,FCcutoff=1000000,pCutoff=0.1, legend = c("NS","Log2 FC","P","P & Log2 FC"),
+  legendLabels = c('NS', expression(Log[2]~FC), "q-value < 0.1", expression(p-value~and~log[2]~FC)),
+                       title=paste(DE_pairList[i,2],"vs", DE_pairList[i,1], "Volcano Plot",
+                                   "(",sum(ex.test_tt$FDR<0.1),")",sep = " "))
+  assign(paste("volc",DE_pairList[i,2],"vs" ,DE_pairList[i,1], sep = "_"), v)
+}
+colnames(de_data) <- c("DE pair","Sig. DE genes (10% FDR)", "Down", "Up")
+plotnames <- ls(knitr::knit_global(),pattern = "^qval.*$")
+volcnames <- ls(knitr::knit_global(),pattern = "^volc.*$")
+```
+
+Results summary table
+
+```{r, echo = F, results = 'asis'}
+kable(de_data)
+```
+
+What does the exact test p-value distribution look like?
+```{r echo=F, message=F, warning=FALSE}
+mget(plotnames)
+```
+
+## Visualizing the results
+
+Let's do some Volcano plots!
+
+```{r, echo=FALSE, message=F, warning=FALSE}
+# make a volcano plot
+mget(volcnames)
+```
+
+## Final step: let's put all the results togheter in an excel file
+```{r, echo=F, message=F, warning=FALSE}
+writeData(wb = wb, sheet = 1, x = sum_table)
+set2 <- list.files(outdir,full.names = T)
+DE_pairList$sheetnames <- paste(DE_pairList[,2],"_vs_",DE_pairList[,1], sep = "")
+DE_pairList <- DE_pairList[order(DE_pairList$sheetname),]
+for (i in 1:length(set1)) {
+  DF1 <- read.csv(set1[i],check.names = F)
+  DF1$dataset <- "set1"
+  DF2 <- read.csv(set2[i],check.names = F)
+  DF2$dataset <- "set2"
+  colnames(DF2) <- colnames(DF1)
+  DF2 <- rbind(DF1, DF2)
+  DF2 <- DF2[order(DF2$FDR),]
+  addWorksheet(wb = wb, sheetName = DE_pairList[i,3])
+  writeData(wb = wb, sheet = i+1, x = DF2)
+  }
+  saveWorkbook(wb = wb, file = paste(outdir,".xlsx", sep = ""), overwrite = T)
+```

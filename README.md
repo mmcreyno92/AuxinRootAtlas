@@ -15,6 +15,9 @@ R markdown script for bin2D, bin2T, and raptor1b mutants phosphoproteomics data 
 - Differential phosphosite intensities assessment using edgeR  
 The script will output a html file including many diagnostic plots  
 
+`NMC_phenotyping_MLM.R`  
+Script used for BL phenotype and MDC staining under sucrose starvation statistical testing by generalized linear model regression
+
 `QuantSeq_dataprocess.slurm`  
 Script for SLURM manager that was used to perform the QuantSeq data processing:  
 - Trimming of raw reads using BBDUK

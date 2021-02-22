@@ -15,6 +15,9 @@ R markdown script for bin2D, bin2T, and raptor1b mutants phosphoproteomics data 
 - Differential phosphosite intensities assessment using edgeR  
 The script will output a html file including many diagnostic plots  
 
+`Fig.5a_heatmap.R`  
+R code used to plot Fig. 5 heatmap. The script will output a PDF file  
+
 `NMC_phenotyping_MLM.R`  
 Script used for BL phenotype and MDC staining under sucrose starvation statistical testing by generalized linear model regression
 

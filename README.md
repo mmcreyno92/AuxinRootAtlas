@@ -20,5 +20,7 @@ R markdown script for root tissue and auxin treatment transcript differential ex
 `30min_IAAvMock_upset_plot.R`
 `120min_IAAvMock_upset_plot.R`
 `Tissue_upset_plot.R`
+`UP_IAAvMock_upset_plot_freq.R`
+`DOWN_IAAvMock_upset_plot_freq.R`
 R script for generating UpSet plots for characterizing overlapping and distinct sets of differentially expressed genes across samples
 - Uses the UpSetR package

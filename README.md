@@ -17,3 +17,8 @@ R markdown script for root tissue and auxin treatment transcript differential ex
 - Uses PoissonSeq for differential expression  
 - Outputs html file containing diagnostic plots of the data
 
+`30min_IAAvMock_upset_plot.R`
+`120min_IAAvMock_upset_plot.R`
+`Tissue_upset_plot.R`
+R script for generating UpSet plots for characterizing overlapping and distinct sets of differentially expressed genes across samples
+- Uses the UpSetR package
